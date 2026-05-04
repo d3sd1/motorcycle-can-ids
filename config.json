@@ -1,0 +1,147 @@
+{
+    "experiment_name": "canbus_anomaly_detection_motorcycle",
+    "paper_slug": "2026-canbus-anomaly-detection-motorcycle",
+    "random_seeds": [42, 123, 456, 789, 1024],
+
+    "data": {
+        "dataset_path": "./data/",
+        "session_files_pattern": ["*.xlsm", "*.xlsx"],
+        "exclude_patterns": ["Plantilla*", "ORGANIZACION*", "Programa*"],
+        "train_ratio": 0.6,
+        "val_ratio": 0.2,
+        "test_ratio": 0.2,
+        "temporal_split": false
+    },
+
+    "can_reconstruction": {
+        "can_ids": {
+            "VCU_throttle": "0x100",
+            "VCU_brake": "0x101",
+            "Motor_speed_current": "0x200",
+            "Motor_temperature": "0x201",
+            "Motor_faults": "0x202",
+            "BMS_pack_voltage": "0x300",
+            "BMS_pack_current": "0x301",
+            "BMS_soc": "0x302",
+            "BMS_temperature": "0x303",
+            "IMU_lean_angle": "0x400",
+            "IMU_acceleration": "0x401",
+            "Dashboard_status": "0x500"
+        },
+        "message_periods_ms": {
+            "VCU": 10,
+            "Motor": 10,
+            "BMS": 100,
+            "IMU": 20,
+            "Dashboard": 50
+        },
+        "bitrate_kbps": 250
+    },
+
+    "feature_extraction": {
+        "window_duration_ms": 100,
+        "window_overlap_ratio": 0.5,
+        "monitored_can_ids": 6,
+        "timing_features_per_id": 3,
+        "payload_features_per_id": 10,
+        "cross_signal_features": 2,
+        "total_features_formula": "13*K + 2 where K=monitored_can_ids"
+    },
+
+    "autoencoder": {
+        "architecture": [80, 40, 20, 10, 20, 40, 80],
+        "activation": "relu",
+        "output_activation": "linear",
+        "latent_dim": 10,
+        "optimizer": "adam",
+        "learning_rate": 0.001,
+        "batch_size": 64,
+        "max_epochs": 200,
+        "early_stopping_patience": 20,
+        "threshold_percentile": 99,
+        "quantization_precision": "int8",
+        "calibration_samples": 1000
+    },
+
+    "baselines": {
+        "threshold": {
+            "n_sigma": 3
+        },
+        "ocsvm": {
+            "kernel": "rbf",
+            "nu": 0.01,
+            "gamma": "auto"
+        },
+        "isolation_forest": {
+            "n_estimators": 100,
+            "contamination": 0.01
+        },
+        "lstm_ae": {
+            "hidden_units": 64,
+            "sequence_length": 10,
+            "optimizer": "adam",
+            "learning_rate": 0.001,
+            "max_epochs": 200,
+            "early_stopping_patience": 20
+        }
+    },
+
+    "attack_injection": {
+        "attacks": {
+            "A1_tps_spoofing": {
+                "target_can_id": "0x100",
+                "spoofed_value_range": [0, 100],
+                "injection_rate_multiplier": [1, 3]
+            },
+            "A2_lean_injection": {
+                "target_can_id": "0x400",
+                "spoofed_lean_range_deg": [-60, 60],
+                "angular_rate_offset_range": [-100, 100]
+            },
+            "A3_bms_disappearance": {
+                "target_can_ids": ["0x300", "0x301", "0x302", "0x303"],
+                "suppression_duration_s": [0.5, 5]
+            },
+            "A4_replay": {
+                "replay_offset_s": [5, 30],
+                "replay_duration_s": [0.5, 3]
+            },
+            "A5_fuzzing": {
+                "payload_range": [0, 255],
+                "injection_rate_fps": [5, 30]
+            },
+            "A6_dos_flooding": {
+                "flooding_rate_fps": [100, 500],
+                "frame_id": "0x000"
+            }
+        },
+        "instances_per_attack_type": 20,
+        "attack_duration_range_s": [0.5, 3]
+    },
+
+    "evaluation": {
+        "metrics": ["precision", "recall", "f1_score", "fpr", "detection_latency_ms"],
+        "report_mean_std": true,
+        "n_runs": 5
+    },
+
+    "embedded": {
+        "target_mcu": "STM32H743VIT6",
+        "core": "ARM Cortex-M7",
+        "clock_mhz": 480,
+        "sram_kb": 512,
+        "flash_mb": 1,
+        "ids_ram_budget_kb": 64,
+        "ids_flash_budget_kb": 128,
+        "latency_target_ms": 5,
+        "compiler_optimization": "-O2",
+        "fpu": "fpv5-d16",
+        "cmsis_nn_version": "5.9"
+    },
+
+    "output": {
+        "results_dir": "results",
+        "figures_dir": "figures",
+        "aggregated_results_file": "results/aggregated_results.json"
+    }
+}

@@ -1,0 +1,11 @@
+# Requirements for CAN bus anomaly detection experiments
+# Paper: 2026-canbus-anomaly-detection-motorcycle
+torch==2.6.0
+numpy==2.2.5
+pandas==2.2.3
+scikit-learn==1.6.1
+matplotlib==3.10.1
+seaborn==0.13.2
+openpyxl==3.1.5
+tqdm==4.67.1
+scipy==1.15.2
