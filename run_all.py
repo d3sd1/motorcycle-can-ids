@@ -4,13 +4,13 @@ One-command orchestrator for all experiments.
 
 Runs the complete pipeline:
 1. Data loading and CAN traffic reconstruction
-2. Feature extraction from all normal traffic
-3. Random split of feature windows (60/20/20)
-4. Attack injection at feature level for test set
-5. Model training (autoencoder + baselines, 5 seeds)
-6. Evaluation (overall + per-attack + quantization + embedded)
-7. Results aggregation
-8. Figure generation
+2. Temporal split of CAN frames by session (60/20/20)
+3. Feature extraction from train/val normal traffic
+4. Per-seed: frame-level attack injection into test traffic
+5. Feature extraction from attacked test traffic
+6. Model training (autoencoder + baselines, 5 seeds)
+7. Evaluation (overall + per-attack + quantization + embedded)
+8. Results aggregation and figure generation
 
 Paper: Lightweight Autoencoder-Based Anomaly Detection for CAN Bus
        in Competition Motorcycles Deployed on ARM Cortex-M7
@@ -26,12 +26,12 @@ import time
 import os
 import platform
 import argparse
+import copy
 import numpy as np
 import torch
 from pathlib import Path
 from datetime import datetime
 
-# Force unbuffered output
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -50,8 +50,9 @@ from evaluate import (evaluate_detector, evaluate_per_attack,
                       threshold_detector, estimate_embedded_resources,
                       estimate_detection_latency_per_attack,
                       ATTACK_NAMES, METHODS)
+from hybrid_detector import (learn_rule_params, build_test_windows,
+                            rule_layer_predict, rule_memory_cost)
 
-# Load config
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 with open(CONFIG_PATH) as f:
     CONFIG = json.load(f)
@@ -67,7 +68,6 @@ CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_hardware_info() -> dict:
-    """Collect hardware information."""
     info = {
         "platform": platform.platform(),
         "processor": platform.processor(),
@@ -82,153 +82,93 @@ def get_hardware_info() -> dict:
     return info
 
 
-def inject_attacks_feature_level(X_normal: np.ndarray, seed: int,
-                                 n_instances_per_type: int = 20) -> tuple:
-    """Inject attacks at the feature level by modifying normal windows.
+def split_sessions_temporal(data_stats: dict, all_frames: list,
+                            train_ratio: float = 0.6,
+                            val_ratio: float = 0.2) -> tuple:
+    """Split CAN frames by session boundaries (stratified shuffle).
 
-    For each attack type, takes a subset of normal windows and modifies
-    their features in ways consistent with each attack's effect on CAN
-    traffic characteristics.
-
-    Returns: (X_test, y_test, attack_types)
+    Shuffles sessions with a fixed seed so each split gets a mix of
+    session types (bench, track, qualifying), then assigns to
+    train/val/test.  No within-session leakage.
     """
-    rng = np.random.default_rng(seed)
-    n_features = X_normal.shape[1]  # 80 features = 6 IDs x 13 + 2
+    session_details = data_stats["session_details"]
+    n_sessions = len(session_details)
 
-    # Feature layout: for each of 6 CAN IDs (13 features each):
-    #   [0:3]  = timing (mean_iat, std_iat, msg_count)
-    #   [3:11] = payload (mean bytes 0-7)
-    #   [11]   = entropy
-    #   [12]   = max_change_rate
-    # + 2 cross-signal features at the end [78, 79]
+    n_train = max(1, int(n_sessions * train_ratio))
+    n_val = max(1, int(n_sessions * val_ratio))
+    n_test = n_sessions - n_train - n_val
+    if n_test < 1:
+        n_val = max(1, n_val - 1)
+        n_test = n_sessions - n_train - n_val
 
-    # ID indices in MONITORED_IDS: 0x100=0, 0x200=1, 0x201=2, 0x300=3, 0x301=4, 0x400=5
+    # Compute per-session frame slices in the original order
+    cum_frames = 0
+    session_slices = []
+    for sd in session_details:
+        start = cum_frames
+        cum_frames += sd["n_frames"]
+        session_slices.append((start, cum_frames))
 
-    attack_windows = []
-    attack_labels = []
-    attack_types_list = []
+    # Shuffle session indices (fixed seed for reproducibility across runs)
+    indices = list(range(n_sessions))
+    rng = np.random.default_rng(seed=0)
+    rng.shuffle(indices)
 
-    def get_id_slice(id_idx):
-        """Get feature slice for CAN ID at index id_idx."""
-        start = id_idx * 13
-        return start, start + 13
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
 
-    for attack_name in ATTACK_NAMES:
-        for _ in range(n_instances_per_type):
-            # Pick a random normal window
-            idx = rng.integers(0, len(X_normal))
-            x = X_normal[idx].copy()
+    train_frames = []
+    for i in sorted(train_idx):
+        s, e = session_slices[i]
+        train_frames.extend(all_frames[s:e])
 
-            if attack_name == "A1_tps_spoofing":
-                # TPS spoofing: modify VCU (ID 0, 0x100) features
-                s, e = get_id_slice(0)
-                # Timing: higher msg count (injected msgs), slightly lower IAT
-                x[s + 0] *= rng.uniform(0.3, 0.8)   # mean IAT decreases
-                x[s + 1] *= rng.uniform(2.0, 5.0)    # std IAT increases (irregular)
-                x[s + 2] *= rng.uniform(1.5, 3.0)    # msg count increases
-                # Payload: spoofed TPS value (bytes 0-1 change drastically)
-                x[s + 3] = rng.uniform(0, 255)        # mean byte 0
-                x[s + 4] = rng.uniform(0, 255)        # mean byte 1
-                x[s + 11] *= rng.uniform(0.3, 0.7)   # entropy drops (constant spoofed val)
-                x[s + 12] *= rng.uniform(3.0, 10.0)  # max change rate spikes
-                # Cross-signal: throttle-current correlation breaks
-                x[78] *= rng.uniform(-0.5, 0.3)
+    val_frames = []
+    for i in sorted(val_idx):
+        s, e = session_slices[i]
+        val_frames.extend(all_frames[s:e])
 
-            elif attack_name == "A2_lean_injection":
-                # Lean angle spoofing: modify IMU (ID 5, 0x400) features
-                s, e = get_id_slice(5)
-                x[s + 0] *= rng.uniform(0.5, 0.9)    # IAT slightly changes
-                x[s + 1] *= rng.uniform(1.5, 4.0)    # std IAT increases
-                x[s + 2] *= rng.uniform(1.0, 2.0)    # msg count may increase
-                x[s + 3] = rng.uniform(0, 255)        # spoofed lean angle bytes
-                x[s + 4] = rng.uniform(0, 255)
-                x[s + 11] *= rng.uniform(0.3, 0.6)   # entropy drops
-                x[s + 12] *= rng.uniform(5.0, 15.0)  # huge change rate
-                # Lean-gyro consistency breaks
-                x[79] *= rng.uniform(-0.5, 0.2)
+    test_frames = []
+    for i in sorted(test_idx):
+        s, e = session_slices[i]
+        test_frames.extend(all_frames[s:e])
 
-            elif attack_name == "A3_bms_disappearance":
-                # BMS disappearance: zero out BMS features (IDs 3,4 = 0x300, 0x301)
-                for bms_id in [3, 4]:
-                    s, e = get_id_slice(bms_id)
-                    x[s:e] = 0.0  # all BMS features go to zero
+    train_names = [session_details[i]["file"] for i in sorted(train_idx)]
+    val_names = [session_details[i]["file"] for i in sorted(val_idx)]
+    test_names = [session_details[i]["file"] for i in sorted(test_idx)]
 
-            elif attack_name == "A4_replay":
-                # Replay: replace with a different normal window's features
-                # but keep timing slightly off (duplicate messages)
-                other_idx = rng.integers(0, len(X_normal))
-                x_other = X_normal[other_idx].copy()
-                # Mix: use payload from other window but timing is doubled
-                for id_idx in range(6):
-                    s, e = get_id_slice(id_idx)
-                    # Keep original timing but slightly modified
-                    x[s + 0] *= rng.uniform(0.7, 0.9)   # IAT decreases
-                    x[s + 1] *= rng.uniform(1.5, 3.0)    # std IAT increases
-                    x[s + 2] *= rng.uniform(1.3, 2.0)    # msg count increases
-                    # Payload from the replayed window
-                    x[s + 3:s + 11] = x_other[s + 3:s + 11]
-                    # Entropy slightly different
-                    x[s + 11] = x_other[s + 11] * rng.uniform(0.8, 1.2)
-                    x[s + 12] *= rng.uniform(1.5, 4.0)   # change rate higher
+    split_info = {
+        "n_sessions_train": n_train,
+        "n_sessions_val": n_val,
+        "n_sessions_test": n_test,
+        "n_frames_train": len(train_frames),
+        "n_frames_val": len(val_frames),
+        "n_frames_test": len(test_frames),
+        "train_sessions": train_names,
+        "val_sessions": val_names,
+        "test_sessions": test_names,
+    }
 
-            elif attack_name == "A5_fuzzing":
-                # Fuzzing: random payloads on random IDs
-                n_fuzzed = rng.integers(1, 4)  # fuzz 1-3 IDs
-                fuzzed_ids = rng.choice(6, n_fuzzed, replace=False)
-                for id_idx in fuzzed_ids:
-                    s, e = get_id_slice(id_idx)
-                    # Timing: extra messages at irregular intervals
-                    x[s + 1] *= rng.uniform(3.0, 8.0)    # std IAT very high
-                    x[s + 2] *= rng.uniform(1.2, 2.0)    # more messages
-                    # Random payloads
-                    x[s + 3:s + 11] = rng.uniform(50, 200, 8)  # random byte means
-                    x[s + 11] = rng.uniform(6.0, 8.0)    # high entropy (random data)
-                    x[s + 12] = rng.uniform(200, 255)     # max change rate very high
-                # Cross-signal correlations break
-                x[78] = rng.uniform(-0.3, 0.3)
-                x[79] = rng.uniform(-0.3, 0.3)
+    return train_frames, val_frames, test_frames, split_info
 
-            elif attack_name == "A6_dos_flooding":
-                # DoS: massive increase in message count, new ID 0x000
-                # All IDs see timing disruption
-                for id_idx in range(6):
-                    s, e = get_id_slice(id_idx)
-                    x[s + 0] *= rng.uniform(1.5, 5.0)    # IAT increases (bus congestion)
-                    x[s + 1] *= rng.uniform(3.0, 10.0)   # std IAT very high
-                    x[s + 2] *= rng.uniform(0.3, 0.7)    # fewer legitimate msgs get through
-                # Cross-signal: everything breaks
-                x[78] = rng.uniform(-0.2, 0.2)
-                x[79] = rng.uniform(-0.2, 0.2)
 
-            attack_windows.append(x)
-            attack_labels.append(1)
-            attack_types_list.append(attack_name)
-
-    # Build test set: normal windows + attack windows
-    n_test_normal = len(X_normal)
-    X_attack = np.array(attack_windows)
-    X_test = np.vstack([X_normal, X_attack])
-    y_test = np.concatenate([np.zeros(n_test_normal, dtype=np.int32),
-                              np.ones(len(attack_windows), dtype=np.int32)])
-    types = np.concatenate([np.array([""] * n_test_normal),
-                             np.array(attack_types_list)])
-
-    # Shuffle
-    perm = rng.permutation(len(X_test))
-    X_test = X_test[perm]
-    y_test = y_test[perm]
-    types = types[perm]
-
-    return X_test, y_test, types
+def clean_nans(X: np.ndarray, name: str) -> np.ndarray:
+    n_nan = int(np.sum(np.isnan(X)))
+    n_inf = int(np.sum(np.isinf(X)))
+    if n_nan > 0 or n_inf > 0:
+        print(f"  WARNING: {name} has {n_nan} NaN and {n_inf} Inf. Replacing with 0.")
+        X[np.isnan(X)] = 0.0
+        X[np.isinf(X)] = 0.0
+    return X
 
 
 def run_pipeline(dry_run: bool = False):
-    """Execute the complete experiment pipeline."""
     start_time = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("=" * 70)
-    print("CAN Bus Anomaly Detection -- Full Experiment Pipeline")
+    print("CAN Bus Anomaly Detection -- Full Experiment Pipeline v2")
+    print("  Frame-level attack injection + per-seed test variation")
     print(f"Timestamp: {timestamp}")
     print(f"Mode: {'DRY RUN (minimal data)' if dry_run else 'FULL'}")
     print("=" * 70, flush=True)
@@ -247,7 +187,7 @@ def run_pipeline(dry_run: bool = False):
     # STEP 1: Data Loading
     # ================================================================
     print(f"\n{'='*70}")
-    print("[1/7] Loading CAN traffic data from testbed...")
+    print("[1/8] Loading CAN traffic data from testbed...")
     print(f"{'='*70}", flush=True)
 
     max_sessions = 3 if dry_run else 20
@@ -256,6 +196,10 @@ def run_pipeline(dry_run: bool = False):
     if not all_frames:
         print("ERROR: No CAN frames loaded. Check dataset path in config.json.")
         sys.exit(1)
+
+    # Fix total_duration_s: sum of per-session durations, not merged range
+    total_duration_s = sum(sd["duration_s"] for sd in data_stats["session_details"])
+    data_stats["total_duration_s"] = round(total_duration_s, 1)
 
     print(f"\nData summary:")
     print(f"  Sessions loaded: {data_stats['n_sessions']}")
@@ -269,99 +213,88 @@ def run_pipeline(dry_run: bool = False):
         json.dump(data_stats, f, indent=2)
 
     # ================================================================
-    # STEP 2: Feature extraction from ALL normal traffic
+    # STEP 2: Temporal split by session (60/20/20)
     # ================================================================
     print(f"\n{'='*70}")
-    print("[2/7] Extracting features from all normal traffic...")
+    print("[2/8] Splitting CAN frames by session (60/20/20 shuffled)...")
     print(f"{'='*70}", flush=True)
 
-    X_all, y_all, types_all = extract_dataset_features(all_frames, MONITORED_IDS)
-    assert np.all(y_all == 0), "All raw data should be normal traffic"
-    print(f"  Total feature windows: {X_all.shape[0]}")
-    print(f"  Feature dimension: {X_all.shape[1]}", flush=True)
-
-    # ================================================================
-    # STEP 3: Random split of windows (60/20/20)
-    # ================================================================
-    print(f"\n{'='*70}")
-    print("[3/7] Splitting windows randomly (60/20/20)...")
-    print(f"{'='*70}", flush=True)
-
-    n_total = len(X_all)
-    rng_split = np.random.default_rng(0)  # fixed seed for split
-    perm = rng_split.permutation(n_total)
-
-    n_train = int(n_total * CONFIG["data"]["train_ratio"])
-    n_val = int(n_total * CONFIG["data"]["val_ratio"])
-
-    train_idx = perm[:n_train]
-    val_idx = perm[n_train:n_train + n_val]
-    test_idx = perm[n_train + n_val:]
-
-    X_train_raw = X_all[train_idx]
-    X_val_raw = X_all[val_idx]
-    X_test_normal = X_all[test_idx]
-
-    print(f"  Train: {len(X_train_raw)} windows (normal)")
-    print(f"  Val:   {len(X_val_raw)} windows (normal)")
-    print(f"  Test (normal part): {len(X_test_normal)} windows", flush=True)
-
-    # ================================================================
-    # STEP 4: Attack injection at feature level + normalization
-    # ================================================================
-    print(f"\n{'='*70}")
-    print("[4/7] Injecting attacks into test set (feature-level)...")
-    print(f"{'='*70}", flush=True)
-
-    n_instances = 5 if dry_run else CONFIG["attack_injection"]["instances_per_attack_type"]
-    X_test_raw, y_test, types_test = inject_attacks_feature_level(
-        X_test_normal, seed=42, n_instances_per_type=n_instances
+    train_frames, val_frames, test_frames_normal, split_info = split_sessions_temporal(
+        data_stats, all_frames,
+        CONFIG["data"]["train_ratio"], CONFIG["data"]["val_ratio"]
     )
 
-    n_attack = int(np.sum(y_test == 1))
-    n_normal = int(np.sum(y_test == 0))
-    print(f"  Attack instances per type: {n_instances}")
-    print(f"  Test set: {n_normal} normal + {n_attack} attack = {len(y_test)} total")
-    print(f"  Attack ratio: {n_attack / len(y_test) * 100:.1f}%", flush=True)
-
-    # Normalize features
-    print("\n  Normalizing features to [0, 1]...")
-    X_train_norm, X_val_norm, X_test_norm, feat_min, feat_max = normalize_features(
-        X_train_raw, X_val_raw, X_test_raw
-    )
-
-    # Handle NaN/Inf
-    for arr_name, arr in [("X_train", X_train_norm), ("X_val", X_val_norm),
-                           ("X_test", X_test_norm)]:
-        n_nan = int(np.sum(np.isnan(arr)))
-        n_inf = int(np.sum(np.isinf(arr)))
-        if n_nan > 0 or n_inf > 0:
-            print(f"  WARNING: {arr_name} has {n_nan} NaN and {n_inf} Inf. Replacing with 0.")
-            arr[np.isnan(arr)] = 0.0
-            arr[np.isinf(arr)] = 0.0
-
-    print(f"\n  Feature shapes: train={X_train_norm.shape}, val={X_val_norm.shape}, "
-          f"test={X_test_norm.shape}", flush=True)
-
-    # Save injection summary
-    injection_summary = {
-        "n_instances_per_type": n_instances,
-        "n_attack_types": 6,
-        "total_attack_windows": n_attack,
-        "total_normal_windows": n_normal,
-        "attack_ratio": round(n_attack / len(y_test), 4),
-    }
-    with open(RESULTS_DIR / "attack_injection_summary.json", "w") as f:
-        json.dump(injection_summary, f, indent=2)
+    print(f"  Train: {split_info['n_sessions_train']} sessions, "
+          f"{split_info['n_frames_train']:,} frames")
+    if "train_sessions" in split_info:
+        for s in split_info["train_sessions"]:
+            print(f"    - {s}")
+    print(f"  Val:   {split_info['n_sessions_val']} sessions, "
+          f"{split_info['n_frames_val']:,} frames")
+    if "val_sessions" in split_info:
+        for s in split_info["val_sessions"]:
+            print(f"    - {s}")
+    print(f"  Test:  {split_info['n_sessions_test']} sessions, "
+          f"{split_info['n_frames_test']:,} frames")
+    if "test_sessions" in split_info:
+        for s in split_info["test_sessions"]:
+            print(f"    - {s}")
+    sys.stdout.flush()
 
     # ================================================================
-    # STEP 5: Training & Evaluation (5 seeds)
+    # STEP 3: Feature extraction from TRAIN and VAL (normal only, once)
     # ================================================================
     print(f"\n{'='*70}")
-    print("[5/7] Training and evaluating all methods (5 seeds)...")
+    print("[3/8] Extracting features from train/val normal traffic...")
     print(f"{'='*70}", flush=True)
 
-    # Model info
+    print("  Extracting train features...")
+    X_train_raw, y_train, _ = extract_dataset_features(train_frames, MONITORED_IDS)
+    assert np.all(y_train == 0), "Train data should be all normal"
+
+    print("  Extracting val features...")
+    X_val_raw, y_val, _ = extract_dataset_features(val_frames, MONITORED_IDS)
+    assert np.all(y_val == 0), "Val data should be all normal"
+
+    print(f"  Train windows: {X_train_raw.shape[0]}")
+    print(f"  Val windows: {X_val_raw.shape[0]}")
+    print(f"  Feature dimension: {X_train_raw.shape[1]}", flush=True)
+
+    # Compute normalization from training data (once)
+    X_train_norm, X_val_norm, feat_min, feat_max = normalize_features(
+        X_train_raw, X_val_raw
+    )
+    X_train_norm = clean_nans(X_train_norm, "X_train")
+    X_val_norm = clean_nans(X_val_norm, "X_val")
+
+    # Normalization stats for reuse
+    feat_range = feat_max - feat_min
+    feat_range[feat_range == 0] = 1.0
+
+    # ----------------------------------------------------------------
+    # Learn hybrid rule-layer parameters from NORMAL training traffic.
+    # Seed-independent (train set is fixed), so computed once.
+    # ----------------------------------------------------------------
+    hb_cfg = CONFIG.get("hybrid", {})
+    HB_K = hb_cfg.get("heartbeat_k", 3)
+    FC_N = hb_cfg.get("freq_n_sigma", 5)
+    print(f"\n  Learning hybrid rule-layer parameters from train traffic "
+          f"(heartbeat k={HB_K}, freq n_sigma={FC_N})...", flush=True)
+    rule_params = learn_rule_params(train_frames, MONITORED_IDS)
+    print(f"    Expected periods (ms): "
+          f"{{{', '.join(f'0x{cid:X}:{p/1000:.1f}' for cid, p in rule_params['periods_us'].items())}}}")
+    print(f"    Normal per-window frame count: "
+          f"mu={rule_params['global_count_mean']:.1f}, "
+          f"sigma={rule_params['global_count_std']:.1f}, "
+          f"max={rule_params['global_count_max']:.0f}")
+    rule_mem = rule_memory_cost(rule_params)
+    print(f"    Rule-layer state: {rule_mem['total_rule_state_bytes']} bytes "
+          f"(heartbeat {rule_mem['heartbeat_state_bytes']} + "
+          f"freq {rule_mem['freq_counter_state_bytes']})", flush=True)
+
+    # ================================================================
+    # STEP 4: Model info
+    # ================================================================
     input_dim = X_train_norm.shape[1]
     latent_dim = CONFIG["autoencoder"]["latent_dim"]
     dummy_ae = CANAutoencoder(input_dim, latent_dim)
@@ -371,26 +304,73 @@ def run_pipeline(dry_run: bool = False):
     print(f"  Input dim: {input_dim}, Latent dim: {latent_dim}")
     print(f"  Architecture: {CONFIG['autoencoder']['architecture']}", flush=True)
 
-    # LSTM sequences
-    seq_len = CONFIG["baselines"]["lstm_ae"]["sequence_length"]
-    X_train_seq = create_sequences(X_train_norm, seq_len)
-    X_val_seq = create_sequences(X_val_norm, seq_len)
-    X_test_seq = create_sequences(X_test_norm, seq_len)
-    y_test_seq = y_test[seq_len - 1:][:len(X_test_seq)]
-    types_test_seq = types_test[seq_len - 1:][:len(X_test_seq)]
+    # ================================================================
+    # STEP 5-6: Per-seed attack injection + training + evaluation
+    # ================================================================
+    print(f"\n{'='*70}")
+    print("[4/8] Per-seed: frame-level injection -> train -> evaluate...")
+    print(f"{'='*70}", flush=True)
 
+    n_instances = 5 if dry_run else CONFIG["attack_injection"]["instances_per_attack_type"]
     all_seed_results = []
     all_roc_data = {}
     all_recon_errors = {"normal": [], "attack": []}
 
     for seed_idx, seed in enumerate(seeds):
-        print(f"\n  --- Seed {seed} ({seed_idx + 1}/{len(seeds)}) ---", flush=True)
+        print(f"\n  {'='*60}")
+        print(f"  Seed {seed} ({seed_idx + 1}/{len(seeds)})")
+        print(f"  {'='*60}", flush=True)
         seed_start = time.time()
         set_all_seeds(seed)
         seed_results = {}
 
+        # ---- Frame-level attack injection into test traffic ----
+        print(f"    [a] Injecting attacks at CAN frame level (seed={seed})...")
+        test_frames_copy = [CANFrame(f.timestamp_us, f.can_id, f.dlc,
+                                     f.data, f.label, f.attack_type)
+                           for f in test_frames_normal]
+
+        attacked_frames, injection_log = inject_all_attacks(
+            test_frames_copy, seed=seed, n_instances=n_instances
+        )
+        n_attack_frames = sum(1 for f in attacked_frames if f.label == "attack")
+        n_normal_frames = sum(1 for f in attacked_frames if f.label == "normal")
+        print(f"      Frames after injection: {len(attacked_frames):,} "
+              f"({n_normal_frames:,} normal + {n_attack_frames:,} attack)")
+        for atk, info in injection_log.items():
+            print(f"        {atk}: {info}", flush=True)
+
+        # ---- Feature extraction from attacked test traffic ----
+        print(f"    [b] Extracting features from attacked test traffic...")
+        X_test_raw, y_test, types_test = extract_dataset_features(
+            attacked_frames, MONITORED_IDS, verbose=False
+        )
+
+        # Normalize using training stats
+        X_test_norm = (X_test_raw - feat_min) / feat_range
+        X_test_norm = clean_nans(X_test_norm, "X_test")
+
+        n_attack_win = int(np.sum(y_test == 1))
+        n_normal_win = int(np.sum(y_test == 0))
+        print(f"      Test windows: {n_normal_win} normal + {n_attack_win} attack "
+              f"= {len(y_test)} total ({n_attack_win/len(y_test)*100:.1f}% attack)")
+
+        # Per-attack window counts
+        for atk in ATTACK_NAMES:
+            n_atk = int(np.sum(types_test == atk))
+            if n_atk > 0:
+                print(f"        {atk}: {n_atk} windows")
+
+        # ---- LSTM sequences for this test set ----
+        seq_len = CONFIG["baselines"]["lstm_ae"]["sequence_length"]
+        X_train_seq = create_sequences(X_train_norm, seq_len)
+        X_val_seq = create_sequences(X_val_norm, seq_len)
+        X_test_seq = create_sequences(X_test_norm, seq_len)
+        y_test_seq = y_test[seq_len - 1:][:len(X_test_seq)]
+        types_test_seq = types_test[seq_len - 1:][:len(X_test_seq)]
+
         # ---- 1. Threshold baseline ----
-        print(f"    Training THRESH...", flush=True)
+        print(f"    [c] Training THRESH...", flush=True)
         t0 = time.time()
         y_pred_thresh, scores_thresh = threshold_detector(
             X_train_norm, X_test_norm,
@@ -409,7 +389,7 @@ def run_pipeline(dry_run: bool = False):
               f"FPR={overall_thresh['fpr']:.4f} ({thresh_time:.1f}s)", flush=True)
 
         # ---- 2. OC-SVM baseline ----
-        print(f"    Training OC-SVM...", flush=True)
+        print(f"    [d] Training OC-SVM...", flush=True)
         t0 = time.time()
         ocsvm = train_ocsvm(X_train_norm, seed, CONFIG)
         ocsvm_pred_raw = ocsvm.predict(X_test_norm)
@@ -428,7 +408,7 @@ def run_pipeline(dry_run: bool = False):
               f"FPR={overall_ocsvm['fpr']:.4f} ({ocsvm_time:.1f}s)", flush=True)
 
         # ---- 3. Isolation Forest baseline ----
-        print(f"    Training IF...", flush=True)
+        print(f"    [e] Training IF...", flush=True)
         t0 = time.time()
         iforest = train_isolation_forest(X_train_norm, seed, CONFIG)
         if_pred_raw = iforest.predict(X_test_norm)
@@ -447,9 +427,11 @@ def run_pipeline(dry_run: bool = False):
               f"FPR={overall_if['fpr']:.4f} ({if_time:.1f}s)", flush=True)
 
         # ---- 4. LSTM-AE baseline ----
-        print(f"    Training LSTM-AE...", flush=True)
+        print(f"    [f] Training LSTM-AE...", flush=True)
         t0 = time.time()
-        if len(X_train_seq) > 0 and len(X_test_seq) > 0:
+        if os.environ.get("SKIP_LSTM") == "1":
+            print("      [skipped via SKIP_LSTM=1]", flush=True)
+        if os.environ.get("SKIP_LSTM") != "1" and len(X_train_seq) > 0 and len(X_test_seq) > 0:
             lstm_model = train_lstm_ae(X_train_seq, X_val_seq, seed, CONFIG, verbose=False)
             lstm_model.eval()
             with torch.no_grad():
@@ -483,18 +465,16 @@ def run_pipeline(dry_run: bool = False):
               f"FPR={overall_lstm.get('fpr', 0):.4f} ({lstm_time:.1f}s)", flush=True)
 
         # ---- 5. Autoencoder (FP32) ----
-        print(f"    Training AE-FP32...", flush=True)
+        print(f"    [g] Training AE-FP32...", flush=True)
         t0 = time.time()
         ae_model, ae_train_info = train_autoencoder(X_train_norm, X_val_norm,
                                                      seed, CONFIG, verbose=False)
         ae_time = time.time() - t0
 
-        # Calibrate threshold
         ae_threshold, val_errors = calibrate_threshold(
             ae_model, X_val_norm, CONFIG["autoencoder"]["threshold_percentile"]
         )
 
-        # Evaluate FP32
         ae_model.eval()
         with torch.no_grad():
             test_tensor = torch.FloatTensor(X_test_norm)
@@ -518,12 +498,11 @@ def run_pipeline(dry_run: bool = False):
               f"FPR={overall_ae['fpr']:.4f} ({ae_time:.1f}s)", flush=True)
 
         # ---- 6. Autoencoder (INT8 quantized) ----
-        print(f"    Quantizing to INT8...", flush=True)
+        print(f"    [h] Quantizing to INT8...", flush=True)
         quant_info = quantize_model_int8(ae_model, X_val_norm[:1000])
         quant_model = quant_info["quantized_model"]
         quant_model.eval()
 
-        # Recalibrate threshold for quantized model
         with torch.no_grad():
             val_tensor = torch.FloatTensor(X_val_norm)
             quant_val_output = quant_model(val_tensor)
@@ -558,6 +537,65 @@ def run_pipeline(dry_run: bool = False):
         print(f"      INT8 size: {quant_info['int8_model_size_kb']:.2f} KB "
               f"(vs {quant_info['fp32_model_size_kb']:.2f} KB FP32)", flush=True)
 
+        # ---- 7. HYBRID multi-layer IDS (rules + learned layer) ----
+        print(f"    [i] Hybrid rule layers (heartbeat + frequency)...", flush=True)
+        t0 = time.time()
+        windows_test = build_test_windows(attacked_frames)
+        assert len(windows_test) == len(y_test), (
+            f"window/label misalignment: {len(windows_test)} vs {len(y_test)}")
+        rule_out = rule_layer_predict(windows_test, rule_params, k=HB_K, n_sigma=FC_N)
+        hb_pred = rule_out["heartbeat"]
+        fc_pred = rule_out["freq"]
+        rule_pred = rule_out["rules"]
+        rule_time = time.time() - t0
+
+        # --- HYBRID = rules OR AE-INT8 (primary proposal) ---
+        y_pred_hybrid = ((y_pred_quant == 1) | (rule_pred == 1)).astype(int)
+        hybrid_scores = quant_errors / max(quant_threshold, 1e-12) + rule_pred.astype(float)
+        overall_hybrid = evaluate_detector(y_test, y_pred_hybrid, hybrid_scores)
+        per_attack_hybrid = evaluate_per_attack(y_test, y_pred_hybrid,
+                                                types_test, hybrid_scores)
+        latency_hybrid = estimate_detection_latency_per_attack(types_test, y_pred_hybrid)
+
+        # Per-layer per-attack recall (diagnostic, for the summary table)
+        per_attack_hb = evaluate_per_attack(y_test, hb_pred, types_test)
+        per_attack_fc = evaluate_per_attack(y_test, fc_pred, types_test)
+        rule_breakdown = {}
+        for atk in ATTACK_NAMES:
+            rule_breakdown[atk] = {
+                "heartbeat_recall": per_attack_hb.get(atk, {}).get("recall", 0.0),
+                "freq_recall": per_attack_fc.get(atk, {}).get("recall", 0.0),
+            }
+
+        seed_results["HYBRID"] = {
+            "overall": overall_hybrid, "per_attack": per_attack_hybrid,
+            "detection_latency": latency_hybrid, "train_time_s": rule_time,
+            "rule_breakdown": rule_breakdown,
+            "rule_thresholds": {
+                "heartbeat_k": HB_K, "freq_n_sigma": FC_N,
+                "global_count_threshold": round(
+                    rule_params["global_count_mean"] + FC_N * rule_params["global_count_std"], 2),
+            },
+        }
+        print(f"      F1={overall_hybrid['f1_score']:.4f}, "
+              f"FPR={overall_hybrid['fpr']:.4f} "
+              f"(rules: heartbeat+freq, {rule_time:.2f}s)", flush=True)
+
+        # --- HYBRID-OCSVM = rules OR OC-SVM (comparison variant) ---
+        y_pred_hybrid_ocsvm = ((y_pred_ocsvm == 1) | (rule_pred == 1)).astype(int)
+        oc_ptp = float(np.ptp(ocsvm_scores)) if np.ptp(ocsvm_scores) > 0 else 1.0
+        hybrid_ocsvm_scores = (ocsvm_scores - float(np.min(ocsvm_scores))) / oc_ptp + rule_pred.astype(float)
+        overall_hybrid_oc = evaluate_detector(y_test, y_pred_hybrid_ocsvm, hybrid_ocsvm_scores)
+        per_attack_hybrid_oc = evaluate_per_attack(y_test, y_pred_hybrid_ocsvm,
+                                                   types_test, hybrid_ocsvm_scores)
+        latency_hybrid_oc = estimate_detection_latency_per_attack(types_test, y_pred_hybrid_ocsvm)
+        seed_results["HYBRID-OCSVM"] = {
+            "overall": overall_hybrid_oc, "per_attack": per_attack_hybrid_oc,
+            "detection_latency": latency_hybrid_oc, "train_time_s": ocsvm_time + rule_time,
+        }
+        print(f"      [HYBRID-OCSVM] F1={overall_hybrid_oc['f1_score']:.4f}, "
+              f"FPR={overall_hybrid_oc['fpr']:.4f}", flush=True)
+
         # Collect figure data (first seed only)
         if seed_idx == 0:
             normal_mask = y_test == 0
@@ -569,7 +607,7 @@ def run_pipeline(dry_run: bool = False):
             for method_name, scores in [
                 ("THRESH", scores_thresh), ("OC-SVM", ocsvm_scores),
                 ("IF", if_scores), ("AE-FP32", ae_errors),
-                ("AE-INT8", quant_errors),
+                ("AE-INT8", quant_errors), ("HYBRID", hybrid_scores),
             ]:
                 if len(np.unique(y_test)) > 1:
                     from sklearn.metrics import roc_curve, auc
@@ -580,7 +618,6 @@ def run_pipeline(dry_run: bool = False):
                         "auc": roc_auc_val,
                     }
 
-        # Save per-seed results
         seed_elapsed = time.time() - seed_start
         seed_results["seed"] = seed
         seed_results["elapsed_s"] = round(seed_elapsed, 1)
@@ -593,14 +630,15 @@ def run_pipeline(dry_run: bool = False):
         print(f"    Seed {seed} completed in {seed_elapsed:.1f}s", flush=True)
 
     # ================================================================
-    # STEP 6: Aggregate Results
+    # STEP 7: Aggregate Results
     # ================================================================
     print(f"\n{'='*70}")
-    print("[6/7] Aggregating results across seeds...")
+    print("[7/8] Aggregating results across seeds...")
     print(f"{'='*70}", flush=True)
 
     aggregated = aggregate_all_results(all_seed_results, n_params, layers_info,
-                                       data_stats, hardware, timestamp)
+                                       data_stats, hardware, timestamp,
+                                       split_info, rule_params)
 
     aggregated["figure_data"] = {
         "reconstruction_errors": all_recon_errors,
@@ -615,7 +653,8 @@ def run_pipeline(dry_run: bool = False):
     print(f"\n  Overall results (mean +/- std over {len(seeds)} seeds):")
     print(f"  {'Method':<12} {'Precision':>12} {'Recall':>12} {'F1':>12} {'FPR':>12}")
     print(f"  {'-'*60}")
-    for method in ["THRESH", "OC-SVM", "IF", "LSTM-AE", "AE-FP32", "AE-INT8"]:
+    for method in ["THRESH", "OC-SVM", "IF", "LSTM-AE", "AE-FP32", "AE-INT8",
+                   "HYBRID", "HYBRID-OCSVM"]:
         if method in aggregated["overall"]:
             m = aggregated["overall"][method]
             print(f"  {method:<12} "
@@ -625,10 +664,10 @@ def run_pipeline(dry_run: bool = False):
                   f"{m['fpr']['mean']:.4f}+/-{m['fpr']['std']:.4f}")
 
     # ================================================================
-    # STEP 7: Generate Figures
+    # STEP 8: Generate Figures
     # ================================================================
     print(f"\n{'='*70}")
-    print("[7/7] Generating paper figures...")
+    print("[8/8] Generating paper figures...")
     print(f"{'='*70}", flush=True)
 
     from generate_figures import generate_all_figures
@@ -645,9 +684,10 @@ def run_pipeline(dry_run: bool = False):
 
 
 def aggregate_all_results(all_seed_results, n_params, layers_info,
-                          data_stats, hardware, timestamp):
-    """Aggregate results across all seeds."""
-    methods_to_report = ["THRESH", "OC-SVM", "IF", "LSTM-AE", "AE-FP32", "AE-INT8"]
+                          data_stats, hardware, timestamp, split_info,
+                          rule_params):
+    methods_to_report = ["THRESH", "OC-SVM", "IF", "LSTM-AE", "AE-FP32",
+                         "AE-INT8", "HYBRID", "HYBRID-OCSVM"]
     metrics_to_aggregate = ["precision", "recall", "f1_score", "fpr", "accuracy"]
 
     overall = {}
@@ -676,29 +716,62 @@ def aggregate_all_results(all_seed_results, n_params, layers_info,
         per_attack[method] = {}
         for attack_type in ATTACK_NAMES:
             f1_values = []
+            precision_values = []
+            recall_values = []
             for sr in all_seed_results:
                 if method in sr and "per_attack" in sr[method]:
                     pa = sr[method]["per_attack"]
-                    if attack_type in pa and "f1_score" in pa[attack_type]:
-                        f1_values.append(pa[attack_type]["f1_score"])
+                    if attack_type in pa:
+                        if "f1_score" in pa[attack_type]:
+                            f1_values.append(pa[attack_type]["f1_score"])
+                        if "precision" in pa[attack_type]:
+                            precision_values.append(pa[attack_type]["precision"])
+                        if "recall" in pa[attack_type]:
+                            recall_values.append(pa[attack_type]["recall"])
             if f1_values:
                 per_attack[method][attack_type] = {
                     "f1_mean": round(float(np.mean(f1_values)), 4),
                     "f1_std": round(float(np.std(f1_values)), 4),
+                    "precision_mean": round(float(np.mean(precision_values)), 4) if precision_values else 0,
+                    "recall_mean": round(float(np.mean(recall_values)), 4) if recall_values else 0,
                 }
 
-    detection_latency = {}
+    def aggregate_latency(method):
+        out = {}
+        for attack_type in ATTACK_NAMES:
+            latency_values = []
+            for sr in all_seed_results:
+                if method in sr and "detection_latency" in sr[method]:
+                    dl = sr[method]["detection_latency"]
+                    if attack_type in dl:
+                        latency_values.append(dl[attack_type]["mean_ms"])
+            if latency_values:
+                out[attack_type] = {
+                    "mean_ms": round(float(np.mean(latency_values)), 1),
+                    "std_ms": round(float(np.std(latency_values)), 1),
+                }
+        return out
+
+    # detection_latency reports the deployed detector (HYBRID); the single
+    # AE-INT8 latency is kept under detection_latency_ae_int8 for the
+    # before/after comparison.
+    detection_latency = aggregate_latency("HYBRID")
+    detection_latency_ae_int8 = aggregate_latency("AE-INT8")
+
+    # Per-layer per-attack recall breakdown (mean over seeds), for the
+    # response letter / summary: how much each rule contributes.
+    rule_breakdown = {}
     for attack_type in ATTACK_NAMES:
-        latency_values = []
+        hb_vals, fc_vals = [], []
         for sr in all_seed_results:
-            if "AE-INT8" in sr and "detection_latency" in sr["AE-INT8"]:
-                dl = sr["AE-INT8"]["detection_latency"]
-                if attack_type in dl:
-                    latency_values.append(dl[attack_type]["mean_ms"])
-        if latency_values:
-            detection_latency[attack_type] = {
-                "mean_ms": round(float(np.mean(latency_values)), 1),
-                "std_ms": round(float(np.std(latency_values)), 1),
+            rb = sr.get("HYBRID", {}).get("rule_breakdown", {})
+            if attack_type in rb:
+                hb_vals.append(rb[attack_type]["heartbeat_recall"])
+                fc_vals.append(rb[attack_type]["freq_recall"])
+        if hb_vals:
+            rule_breakdown[attack_type] = {
+                "heartbeat_recall_mean": round(float(np.mean(hb_vals)), 4),
+                "freq_recall_mean": round(float(np.mean(fc_vals)), 4),
             }
 
     quant_data = [sr["AE-INT8"]["quantization"] for sr in all_seed_results
@@ -719,6 +792,19 @@ def aggregate_all_results(all_seed_results, n_params, layers_info,
     int8_resources = estimate_embedded_resources(n_params, layers_info, "int8")
     fp32_resources = estimate_embedded_resources(n_params, layers_info, "fp32")
 
+    # Rule-layer (heartbeat + frequency counter) embedded cost
+    rule_resources = rule_memory_cost(rule_params)
+    # Hybrid total = INT8 learned layer + tiny rule state
+    hybrid_resources = dict(int8_resources)
+    hybrid_resources["rule_layers"] = rule_resources
+    hybrid_resources["hybrid_total_ram_bytes"] = (
+        int8_resources["runtime_ram_bytes"] + rule_resources["total_rule_state_bytes"])
+    hybrid_resources["hybrid_total_ram_kb"] = round(
+        hybrid_resources["hybrid_total_ram_bytes"] / 1024, 2)
+    hybrid_resources["rule_overhead_ram_pct"] = round(
+        100.0 * rule_resources["total_rule_state_bytes"]
+        / int8_resources["runtime_ram_bytes"], 3)
+
     train_times = {}
     for method in methods_to_report:
         times = [sr[method]["train_time_s"] for sr in all_seed_results
@@ -737,6 +823,7 @@ def aggregate_all_results(all_seed_results, n_params, layers_info,
         "n_seeds": len(CONFIG["random_seeds"]),
         "hardware": hardware,
         "dataset": data_stats,
+        "split": split_info,
         "model": {
             "architecture": CONFIG["autoencoder"]["architecture"],
             "total_parameters": n_params,
@@ -747,13 +834,36 @@ def aggregate_all_results(all_seed_results, n_params, layers_info,
         "overall": overall,
         "per_attack": per_attack,
         "detection_latency": detection_latency,
+        "detection_latency_ae_int8": detection_latency_ae_int8,
+        "rule_breakdown": rule_breakdown,
+        "hybrid_config": {
+            "heartbeat_k": CONFIG.get("hybrid", {}).get("heartbeat_k", 3),
+            "freq_n_sigma": CONFIG.get("hybrid", {}).get("freq_n_sigma", 5),
+            "unknown_id_min_count": CONFIG.get("hybrid", {}).get("unknown_id_min_count", 3),
+            "reset_gap_us": CONFIG.get("hybrid", {}).get("reset_gap_us", 1000000),
+            "window_duration_ms": CONFIG["feature_extraction"]["window_duration_ms"],
+            "window_stride_ms": CONFIG["feature_extraction"]["window_duration_ms"]
+                                * (1 - CONFIG["feature_extraction"]["window_overlap_ratio"]),
+            "fusion": "OR",
+            "expected_periods_ms": {f"0x{cid:X}": round(p / 1000, 2)
+                                    for cid, p in rule_params["periods_us"].items()},
+            "global_count_mean": round(rule_params["global_count_mean"], 2),
+            "global_count_std": round(rule_params["global_count_std"], 2),
+            "global_count_threshold": round(
+                rule_params["global_count_mean"]
+                + CONFIG.get("hybrid", {}).get("freq_n_sigma", 5)
+                * rule_params["global_count_std"], 2),
+        },
         "quantization": quant_analysis,
         "embedded_resources": {
             "int8": int8_resources,
             "fp32": fp32_resources,
+            "rule_layers": rule_resources,
+            "hybrid": hybrid_resources,
         },
         "training_times": train_times,
         "attack_instances_per_type": CONFIG["attack_injection"]["instances_per_attack_type"],
+        "attack_injection_level": "frame-level",
     }
 
 

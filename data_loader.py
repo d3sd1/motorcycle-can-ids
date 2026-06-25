@@ -393,6 +393,9 @@ def load_all_sessions(max_sessions: int = 0) -> Tuple[List[CANFrame], Dict]:
     }
 
     sessions_loaded = 0
+    cumulative_offset_us = 0
+    GAP_BETWEEN_SESSIONS_US = 10_000_000  # 10 s gap between sessions
+
     for filepath in files:
         if max_sessions > 0 and sessions_loaded >= max_sessions:
             break
@@ -405,6 +408,12 @@ def load_all_sessions(max_sessions: int = 0) -> Tuple[List[CANFrame], Dict]:
                 n_frames = len(session_frames)
                 duration = (session_frames[-1].timestamp_us - session_frames[0].timestamp_us) / 1e6
                 ids_in_session = set(f.can_id for f in session_frames)
+
+                # Offset timestamps so sessions don't overlap after sort
+                base_ts = session_frames[0].timestamp_us
+                for frame in session_frames:
+                    frame.timestamp_us = (frame.timestamp_us - base_ts) + cumulative_offset_us
+                cumulative_offset_us = session_frames[-1].timestamp_us + GAP_BETWEEN_SESSIONS_US
 
                 all_frames.extend(session_frames)
                 stats["n_sessions"] += 1
@@ -434,8 +443,8 @@ def load_all_sessions(max_sessions: int = 0) -> Tuple[List[CANFrame], Dict]:
 
     if all_frames:
         all_frames.sort(key=lambda f: f.timestamp_us)
-        duration = (all_frames[-1].timestamp_us - all_frames[0].timestamp_us) / 1e6
-        stats["total_duration_s"] = round(duration, 1)
+        total_duration_s = sum(sd["duration_s"] for sd in stats["session_details"])
+        stats["total_duration_s"] = round(total_duration_s, 1)
 
     return all_frames, stats
 

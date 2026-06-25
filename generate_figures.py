@@ -45,12 +45,14 @@ RESULTS_DIR = Path(__file__).parent / "results"
 
 # Accessible color palette (avoid red-green for colorblind)
 COLORS = {
-    "THRESH": "#4477AA",     # Blue
-    "OC-SVM": "#EE6677",     # Red/pink
-    "IF": "#228833",         # Green
-    "LSTM-AE": "#CCBB44",    # Yellow
-    "AE-FP32": "#AA3377",    # Purple
-    "AE-INT8": "#66CCEE",    # Cyan
+    "THRESH": "#4477AA",       # Blue
+    "OC-SVM": "#EE6677",       # Red/pink
+    "IF": "#228833",           # Green
+    "LSTM-AE": "#CCBB44",      # Yellow
+    "AE-FP32": "#AA3377",      # Purple
+    "AE-INT8": "#66CCEE",      # Cyan
+    "HYBRID": "#222255",       # Dark navy (proposed)
+    "HYBRID-OCSVM": "#999933",  # Olive
 }
 
 ATTACK_SHORT = {
@@ -149,13 +151,14 @@ def fig_roc_curves(results: dict):
     # Plot random baseline
     ax.plot([0, 1], [0, 1], "k--", alpha=0.3, lw=0.8, label="Random")
 
-    methods_order = ["THRESH", "OC-SVM", "IF", "AE-FP32", "AE-INT8"]
+    methods_order = ["THRESH", "OC-SVM", "IF", "AE-INT8", "HYBRID"]
     for method in methods_order:
         if method in roc_data:
             rd = roc_data[method]
             label = f"{method} (AUC={rd['auc']:.3f})"
+            lw = 2.2 if method == "HYBRID" else 1.4
             ax.plot(rd["fpr"], rd["tpr"], color=COLORS.get(method, "#333333"),
-                    lw=1.5, label=label)
+                    lw=lw, label=label)
 
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
@@ -214,7 +217,7 @@ def fig_per_attack_f1(results: dict):
         return
 
     attack_types = list(ATTACK_SHORT.keys())
-    methods = ["THRESH", "OC-SVM", "IF", "LSTM-AE", "AE-INT8"]
+    methods = ["THRESH", "OC-SVM", "AE-INT8", "HYBRID"]
 
     fig, ax = plt.subplots(1, 1, figsize=(7.0, 3.5))
 
@@ -324,6 +327,64 @@ def fig_quantization_impact(results: dict):
     print("  Generated: fig_quantization_impact.pdf")
 
 
+def fig_hybrid_improvement(results: dict):
+    """Figure 6: Before/after of the hybrid IDS.
+
+    Left: per-attack F1 for single AE-INT8 vs HYBRID.
+    Right: detection latency (log scale) for AE-INT8 vs HYBRID, highlighting
+    the A3 (absence) and A6 (flooding) collapse.
+    """
+    per_attack = results.get("per_attack", {})
+    lat_hybrid = results.get("detection_latency", {})
+    lat_ae = results.get("detection_latency_ae_int8", {})
+    if not per_attack or "HYBRID" not in per_attack or "AE-INT8" not in per_attack:
+        print("  SKIP: No hybrid data for fig_hybrid_improvement.pdf")
+        return
+
+    attack_types = list(ATTACK_SHORT.keys())
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.2))
+
+    x = np.arange(len(attack_types))
+    width = 0.38
+
+    ae_f1 = [per_attack["AE-INT8"].get(a, {}).get("f1_mean", 0) for a in attack_types]
+    hy_f1 = [per_attack["HYBRID"].get(a, {}).get("f1_mean", 0) for a in attack_types]
+    ae_f1_std = [per_attack["AE-INT8"].get(a, {}).get("f1_std", 0) for a in attack_types]
+    hy_f1_std = [per_attack["HYBRID"].get(a, {}).get("f1_std", 0) for a in attack_types]
+
+    ax1.bar(x - width/2, ae_f1, width, yerr=ae_f1_std, label="AE-INT8 (single)",
+            color=COLORS["AE-INT8"], edgecolor="white", lw=0.5, capsize=2,
+            error_kw={"lw": 0.8})
+    ax1.bar(x + width/2, hy_f1, width, yerr=hy_f1_std, label="HYBRID",
+            color=COLORS["HYBRID"], edgecolor="white", lw=0.5, capsize=2,
+            error_kw={"lw": 0.8})
+    ax1.set_ylabel("F1-Score")
+    ax1.set_xlabel("Attack Type")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([ATTACK_SHORT[a] for a in attack_types], fontsize=8)
+    ax1.set_ylim(0, 1.08)
+    ax1.legend(loc="upper center", fontsize=7, framealpha=0.9)
+    ax1.yaxis.set_major_locator(ticker.MultipleLocator(0.2))
+
+    ae_lat = [lat_ae.get(a, {}).get("mean_ms", 0) for a in attack_types]
+    hy_lat = [lat_hybrid.get(a, {}).get("mean_ms", 0) for a in attack_types]
+    ax2.bar(x - width/2, ae_lat, width, label="AE-INT8 (single)",
+            color=COLORS["AE-INT8"], edgecolor="white", lw=0.5)
+    ax2.bar(x + width/2, hy_lat, width, label="HYBRID",
+            color=COLORS["HYBRID"], edgecolor="white", lw=0.5)
+    ax2.set_yscale("log")
+    ax2.set_ylabel("Detection Latency (ms)")
+    ax2.set_xlabel("Attack Type")
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([ATTACK_SHORT[a] for a in attack_types], fontsize=8)
+    ax2.legend(loc="upper right", fontsize=7, framealpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(FIGURES_DIR / "fig_hybrid_improvement.pdf")
+    plt.close(fig)
+    print("  Generated: fig_hybrid_improvement.pdf")
+
+
 def generate_all_figures(results: dict):
     """Generate all paper figures from aggregated results."""
     print("\nGenerating figures...")
@@ -333,6 +394,7 @@ def generate_all_figures(results: dict):
     fig_reconstruction_error(results)
     fig_per_attack_f1(results)
     fig_quantization_impact(results)
+    fig_hybrid_improvement(results)
 
     print(f"\nAll figures saved to: {FIGURES_DIR}")
 

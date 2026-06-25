@@ -4,7 +4,7 @@
     "random_seeds": [42, 123, 456, 789, 1024],
 
     "data": {
-        "dataset_path": "./data/",
+        "dataset_path": "../../../../datasets/dataset_motostudent_electric/",
         "session_files_pattern": ["*.xlsm", "*.xlsx"],
         "exclude_patterns": ["Plantilla*", "ORGANIZACION*", "Programa*"],
         "train_ratio": 0.6,
@@ -73,17 +73,28 @@
             "gamma": "auto"
         },
         "isolation_forest": {
-            "n_estimators": 100,
-            "contamination": 0.01
+            "n_estimators": 200,
+            "contamination": "auto"
         },
         "lstm_ae": {
-            "hidden_units": 64,
-            "sequence_length": 10,
+            "hidden_units": 32,
+            "sequence_length": 5,
+            "dropout": 0.15,
             "optimizer": "adam",
-            "learning_rate": 0.001,
+            "learning_rate": 0.0005,
             "max_epochs": 200,
-            "early_stopping_patience": 20
+            "early_stopping_patience": 25
         }
+    },
+
+    "hybrid": {
+        "heartbeat_k": 3,
+        "freq_n_sigma": 5,
+        "unknown_id_min_count": 3,
+        "reset_gap_us": 1000000,
+        "liveness_ids": "all_monitored",
+        "fusion": "OR",
+        "_comment": "Rule layers: heartbeat (liveness) targets A3, frequency-counter targets A6. Fused by OR with the learned layer (AE-INT8 or OC-SVM)."
     },
 
     "attack_injection": {
@@ -115,8 +126,8 @@
                 "frame_id": "0x000"
             }
         },
-        "instances_per_attack_type": 20,
-        "attack_duration_range_s": [0.5, 3]
+        "instances_per_attack_type": 30,
+        "attack_duration_range_s": [1, 5]
     },
 
     "evaluation": {

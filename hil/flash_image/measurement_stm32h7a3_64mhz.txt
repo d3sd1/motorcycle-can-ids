@@ -1,0 +1,28 @@
+On-silicon HIL measurement — STM32H7A3ZIT6Q (Cortex-M7 r1p1), ST-LINK V3, openocd 0.12, semihosting.
+Target voltage 3.304 V. DWT CYCCNT, N=1000 inferences. Kernel: self-contained int8 FC (== arm_fully_connected_s8), USE_CMSIS_NN off (portable scalar, conservative).
+Date: 2026-06-25.
+
+core_clock      : 64000000 Hz (post-reset HSI; cycles are the clock-invariant quantity)
+network         : 80-40-20-10-20-40-80, ReLU hidden, linear out
+MACs/inference  : 8400
+
+latency min     : 137740 cyc  = 2152.18 us @64MHz
+latency median  : 137740 cyc  = 2152.18 us @64MHz
+latency mean    : 137740 cyc  = 2152.18 us @64MHz
+latency max     : 137753 cyc  = 2152.39 us @64MHz   (max-min = 13 cyc; deterministic)
+feature-extract : 3397   cyc  = 53.07 us  @64MHz
+end-to-end      : 141137 cyc  = 2205.3 us @64MHz
+
+activation RAM  : 160 bytes   (on-chip confirmed)
+model Flash     : 9240 bytes  (on-chip confirmed)
+
+Scaled to deployment clock 280 MHz (cycles / 280e6; flash wait-states/ART may add modest overhead):
+  inference   = 137740/280e6 = 491.9 us
+  feat-extract=   3397/280e6 =  12.1 us
+  end-to-end  = 141137/280e6 = 504.1 us = 0.504 ms   (~10x under the 5 ms budget)
+  CPU util @100Hz @280MHz = 504.1us*100/1e4 = 5.04 %
+
+Note: measured cycle count (~138k = ~16.4 cyc/MAC) reflects the PORTABLE SCALAR kernel and is CONSERVATIVE;
+the optimized CMSIS-NN SIMD path (arm_fully_connected_s8, SMLAD) would reduce it materially.
+The analytical CMSIS-NN projection in the prior submission (~17k cyc) under-counted real scalar int8 cost ~8x
+— motivating on-silicon validation (the reviewers' point). Real-time feasibility holds at both clocks.

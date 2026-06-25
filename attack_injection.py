@@ -132,9 +132,13 @@ def inject_lean_angle(frames: List[CANFrame], rng: np.random.Generator,
 
 def inject_bms_disappearance(frames: List[CANFrame], rng: np.random.Generator,
                              config: dict) -> Tuple[List[int], int, int]:
-    """A3: Suppress BMS messages.
+    """A3: Suppress BMS messages by removing them from the bus.
 
-    Returns (indices_to_mark_as_attack, start_time_us, end_time_us)
+    Simulates a BMS node going offline: its CAN frames stop appearing
+    entirely during the attack window. Returns indices to remove plus
+    the attack time interval for labeling affected windows.
+
+    Returns (indices_to_remove, start_time_us, end_time_us)
     """
     attack_config = config["attack_injection"]["attacks"]["A3_bms_disappearance"]
     target_ids = [int(x, 16) for x in attack_config["target_can_ids"]]
@@ -145,14 +149,14 @@ def inject_bms_disappearance(frames: List[CANFrame], rng: np.random.Generator,
     start_time = frames[start_idx].timestamp_us
     end_time = start_time + int(duration_s * 1e6)
 
-    indices_to_suppress = []
+    indices_to_remove = []
     for i, frame in enumerate(frames):
         if (frame.can_id in target_ids and
                 start_time <= frame.timestamp_us <= end_time and
                 frame.label == "normal"):
-            indices_to_suppress.append(i)
+            indices_to_remove.append(i)
 
-    return indices_to_suppress, start_time, end_time
+    return indices_to_remove, start_time, end_time
 
 
 def inject_replay(frames: List[CANFrame], rng: np.random.Generator,
@@ -288,23 +292,48 @@ def inject_all_attacks(frames: List[CANFrame], seed: int,
             "total_frames_injected": total_injected,
         }
 
-    # Handle A3 (BMS disappearance) separately - marks frames as attack
+    # Handle A3 (BMS disappearance) separately — suppress frames entirely
+    # and insert invisible marker frames for window labeling
     a3_total_suppressed = 0
+    a3_intervals = []
+    indices_to_remove = set()
     for _ in range(n_instances):
         indices, start, end = inject_bms_disappearance(result, rng, CONFIG)
-        for idx in indices:
-            result[idx] = CANFrame(
-                timestamp_us=result[idx].timestamp_us,
-                can_id=result[idx].can_id,
-                dlc=result[idx].dlc,
-                data=b'\x00' * 8,  # zero payload (BMS disappeared)
+        indices_to_remove.update(indices)
+        a3_total_suppressed += len(indices)
+        a3_intervals.append((start, end))
+
+    # Remove suppressed BMS frames (reverse order to preserve indices)
+    for idx in sorted(indices_to_remove, reverse=True):
+        if idx < len(result):
+            del result[idx]
+
+    # Insert marker frames with non-monitored CAN ID for window labeling.
+    # Markers are placed across the WHOLE suppression interval (one every
+    # ~stride) so that every sliding window overlapping the interval is
+    # labelled A3.  Physically, the BMS node is absent for the entire
+    # interval, so the entire interval is anomalous ground truth -- the
+    # previous single mid-interval marker under-labelled A3.  The marker
+    # ID (0xFFF, dlc=0) is non-monitored: it does not affect any extracted
+    # feature and is ignored by the rule layers.
+    fe = CONFIG["feature_extraction"]
+    marker_step_us = max(1, int(fe["window_duration_ms"] * (1 - fe["window_overlap_ratio"]) * 1000))
+    for start, end in a3_intervals:
+        t = start
+        while t <= end:
+            result.append(CANFrame(
+                timestamp_us=int(t),
+                can_id=0xFFF,  # non-monitored ID, won't affect features
+                dlc=0,
+                data=b'\x00' * 8,
                 label="attack",
                 attack_type="A3_bms_disappearance",
-            )
-        a3_total_suppressed += len(indices)
+            ))
+            t += marker_step_us
+
     injection_log["A3_bms_disappearance"] = {
         "instances": n_instances,
-        "total_frames_affected": a3_total_suppressed,
+        "total_frames_suppressed": a3_total_suppressed,
     }
 
     # Sort by timestamp

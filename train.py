@@ -105,20 +105,25 @@ class LSTMAutoencoder(nn.Module):
     This is a baseline method -- more powerful but too large for Cortex-M7.
     """
 
-    def __init__(self, input_dim: int = 80, hidden_dim: int = 64, seq_len: int = 10):
+    def __init__(self, input_dim: int = 80, hidden_dim: int = 32,
+                 seq_len: int = 5, dropout: float = 0.15):
         super().__init__()
         self.seq_len = seq_len
         self.hidden_dim = hidden_dim
 
-        self.encoder_lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.encoder_lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True,
+                                    dropout=0)
+        self.dropout = nn.Dropout(dropout)
+        self.decoder_lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True,
+                                    dropout=0)
         self.output_layer = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, x):
-        # x: (batch, seq_len, input_dim)
         _, (h, c) = self.encoder_lstm(x)
+        h = self.dropout(h)
         decoder_input = h.permute(1, 0, 2).repeat(1, self.seq_len, 1)
         decoder_out, _ = self.decoder_lstm(decoder_input, (h, c))
+        decoder_out = self.dropout(decoder_out)
         output = self.output_layer(decoder_out)
         return output
 
@@ -330,9 +335,12 @@ def train_ocsvm(X_train: np.ndarray, seed: int, config: dict) -> object:
 def train_isolation_forest(X_train: np.ndarray, seed: int, config: dict) -> object:
     """Train Isolation Forest baseline."""
     if_config = config["baselines"]["isolation_forest"]
+    contam = if_config["contamination"]
+    if isinstance(contam, str):
+        contam = contam  # "auto" is valid for sklearn
     model = IsolationForest(
         n_estimators=if_config["n_estimators"],
-        contamination=if_config["contamination"],
+        contamination=contam,
         random_state=seed,
         n_jobs=-1,
     )
@@ -352,6 +360,7 @@ def train_lstm_ae(X_train_seq: np.ndarray, X_val_seq: np.ndarray,
         input_dim=input_dim,
         hidden_dim=lstm_config["hidden_units"],
         seq_len=lstm_config["sequence_length"],
+        dropout=lstm_config.get("dropout", 0.15),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lstm_config["learning_rate"])
     criterion = nn.MSELoss()

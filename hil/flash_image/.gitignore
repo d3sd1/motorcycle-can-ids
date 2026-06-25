@@ -1,0 +1,4 @@
+# Build intermediates
+*.o
+ids_bench.map
+# Keep the flashable deliverables tracked: ids_bench.elf / .bin / .hex
